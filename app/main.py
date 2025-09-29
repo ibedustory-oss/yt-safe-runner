@@ -1,54 +1,71 @@
-
 import os
 import json
 import sqlite3
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify
+from typing import Optional, List, Dict, Any
+
 import requests
+from flask import Flask, request, jsonify
 
-YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
-CHANNEL_IDS = [c.strip() for c in os.environ.get("CHANNEL_IDS", "").split(",") if c.strip()]
+# ── Environment ────────────────────────────────────────────────────────────────
+YT_API_KEY: str = os.environ.get("YOUTUBE_API_KEY", "")
+CHANNEL_IDS: List[str] = [c.strip() for c in os.environ.get("CHANNEL_IDS", "").split(",") if c.strip()]
 
-DB_PATH = os.environ.get("DB_PATH", "/tmp/state.db")  # Cloud Runなら/tmpは書き込み可（短期）
+# Cloud Run では /tmp が書き込み可。MVP用。→本番はCloud SQL等へ置換推奨
+DB_PATH: str = os.environ.get("DB_PATH", "/tmp/state.db")
 
 app = Flask(__name__)
 
-def init_db():
+# ── DB helpers ────────────────────────────────────────────────────────────────
+def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS channel_state (channel_id TEXT PRIMARY KEY, last_published_at TEXT)"
+            """
+            CREATE TABLE IF NOT EXISTS channel_state (
+              channel_id TEXT PRIMARY KEY,
+              last_published_at TEXT
+            )
+            """
         )
         conn.commit()
 
-def get_last_published_at(channel_id: str) -> str | None:
+def get_last_published_at(channel_id: str) -> Optional[str]:
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT last_published_at FROM channel_state WHERE channel_id = ?", (channel_id,))
+        cur = conn.execute(
+            "SELECT last_published_at FROM channel_state WHERE channel_id = ?",
+            (channel_id,),
+        )
         row = cur.fetchone()
         return row[0] if row else None
 
-def set_last_published_at(channel_id: str, published_at: str):
+def set_last_published_at(channel_id: str, published_at: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO channel_state(channel_id, last_published_at) VALUES(?, ?) ON CONFLICT(channel_id) DO UPDATE SET last_published_at=excluded.last_published_at",
+            """
+            INSERT INTO channel_state(channel_id, last_published_at)
+            VALUES(?, ?)
+            ON CONFLICT(channel_id)
+            DO UPDATE SET last_published_at=excluded.last_published_at
+            """,
             (channel_id, published_at),
         )
         conn.commit()
 
-def isoformat(dt: datetime) -> str:
-    return dt.replace(microsecond=0).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def fetch_new_videos_for_channel(channel_id: str):
-    # 前回取得の最終時刻を得る
+# ── YouTube fetcher ───────────────────────────────────────────────────────────
+def fetch_new_videos_for_channel(channel_id: str) -> List[Dict[str, Any]]:
+    """
+    指定チャンネルの新着動画を YouTube Data API で取得。
+    初回は直近24時間に限定（無限取得を避ける）。
+    以降は DB の last_published_at を publishedAfter に使用。
+    """
     last = get_last_published_at(channel_id)
     if last is None:
-        # 初回は直近24時間に限定（無限取得を避ける）
-        since = datetime.now(timezone.utc).timestamp() - 24*3600
+        since = datetime.now(timezone.utc).timestamp() - 24 * 3600
         published_after = datetime.fromtimestamp(since, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     else:
         published_after = last
 
-    # YouTube Data API: search.list でpublishedAfterフィルタ（チャンネル内最新順）
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "key": YT_API_KEY,
@@ -64,56 +81,70 @@ def fetch_new_videos_for_channel(channel_id: str):
     data = r.json()
     items = data.get("items", [])
 
-    videos = []
+    videos: List[Dict[str, Any]] = []
     latest_ts_iso = published_after
     for it in items:
         vid = it["id"]["videoId"]
         sn = it["snippet"]
         published_at = sn["publishedAt"]
-        title = sn["title"]
+        title = sn.get("title", "")
         description = sn.get("description", "")
         thumbnails = sn.get("thumbnails", {})
         channel_title = sn.get("channelTitle", "")
 
-        videos.append({
-            "videoId": vid,
-            "publishedAt": published_at,
-            "title": title,
-            "description": description,
-            "thumbnails": thumbnails,
-            "channelId": channel_id,
-            "channelTitle": channel_title,
-            "url": f"https://www.youtube.com/watch?v={vid}",
-        })
-        # 最新のpublishedAtを更新用に保持
+        videos.append(
+            {
+                "videoId": vid,
+                "publishedAt": published_at,
+                "title": title,
+                "description": description,
+                "thumbnails": thumbnails,
+                "channelId": channel_id,
+                "channelTitle": channel_title,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+            }
+        )
         if published_at > latest_ts_iso:
             latest_ts_iso = published_at
 
-    # state更新
     if latest_ts_iso and latest_ts_iso > published_after:
         set_last_published_at(channel_id, latest_ts_iso)
 
     return videos
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/")
+def index():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "YouTube Safe Kids Fetcher (MVP)",
+            "try": ["GET /health", "POST /fetch", "GET /fetch"],
+            "channels": CHANNEL_IDS,
+        }
+    )
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
-@app.post("/fetch")
+@app.route("/fetch", methods=["POST", "GET"])
 def fetch():
     if not YT_API_KEY or not CHANNEL_IDS:
         return jsonify({"error": "Missing YOUTUBE_API_KEY or CHANNEL_IDS"}), 400
+
     init_db()
-    all_new = []
+    all_new: List[Dict[str, Any]] = []
     for ch in CHANNEL_IDS:
         try:
             vids = fetch_new_videos_for_channel(ch)
             all_new.extend(vids)
         except Exception as e:
             all_new.append({"channelId": ch, "error": str(e)})
-    # ここで本来はPub/SubやDB保存に切り替える
+
     return jsonify({"count": len(all_new), "videos": all_new})
 
+# ── Local debug ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # for local debugging
-    app.run(host="0.0.0.0", port=8080)
+    # ローカル実行用（Cloud Runではgunicornで起動）
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
